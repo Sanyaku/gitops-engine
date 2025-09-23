@@ -1087,8 +1087,8 @@ func (c *clusterCache) IterateHierarchyV2(keys []kube.ResourceKey, action func(r
 		keysPerNamespace[key.Namespace] = append(keysPerNamespace[key.Namespace], key)
 	}
 
-	// Collect missing owner references during regular namespace processing
-	var missingRefs []missingOwnerRef
+	// Pre-allocate missing refs slice with estimated capacity to reduce allocations
+	missingRefs := make([]missingOwnerRef, 0, len(keys)) // Estimate: max one missing ref per key
 	
 	// Process regular namespaces first (not cluster-scoped)
 	for namespace, namespaceKeys := range keysPerNamespace {
@@ -1097,10 +1097,9 @@ func (c *clusterCache) IterateHierarchyV2(keys []kube.ResourceKey, action func(r
 		}
 		nsNodes := c.nsIndex[namespace]
 		
-		// For regular namespaces, collect missing owner references instead of resolving them
-		var collectedMissingRefs []missingOwnerRef
-		graph := buildGraphWithMissingRefs(nsNodes, nil, &collectedMissingRefs)
-		missingRefs = append(missingRefs, collectedMissingRefs...)
+		// For regular namespaces, collect missing owner references during graph building
+		// Reuse the same slice to minimize allocations
+		graph := buildGraphWithMissingRefs(nsNodes, nil, &missingRefs)
 		
 		c.processNamespaceHierarchy(namespaceKeys, nsNodes, graph, action)
 	}
@@ -1109,9 +1108,11 @@ func (c *clusterCache) IterateHierarchyV2(keys []kube.ResourceKey, action func(r
 	if clusterKeys, exists := keysPerNamespace[""]; exists {
 		nsNodes := c.nsIndex[""]
 		
-		// Batch resolve all collected missing owner references
-		if !c.disableClusterScopedParentRefs {
-			for _, missing := range missingRefs {
+		// Batch resolve all collected missing owner references in a single pass
+		if !c.disableClusterScopedParentRefs && len(missingRefs) > 0 {
+			// Optimized batch resolution - only iterate if we have refs to resolve
+			for i := range missingRefs {
+				missing := &missingRefs[i] // Use pointer to avoid copying struct
 				if parent, exists := nsNodes[missing.parentKey]; exists {
 					missing.childResource.OwnerRefs[missing.ownerRefIndex].UID = parent.Ref.UID
 				}
@@ -1160,6 +1161,7 @@ func (c *clusterCache) processNamespaceHierarchy(namespaceKeys []kube.ResourceKe
 }
 
 // buildGraphWithMissingRefs builds a resource graph but collects missing owner references instead of resolving them
+// Optimized version to minimize allocations and improve cache locality
 func buildGraphWithMissingRefs(nsNodes map[kube.ResourceKey]*Resource, allResources map[kube.ResourceKey]*Resource, missingRefs *[]missingOwnerRef) map[kube.ResourceKey]map[types.UID]*Resource {
 	// Prepare to construct a graph
 	nodesByUID := make(map[types.UID][]*Resource, len(nsNodes))
