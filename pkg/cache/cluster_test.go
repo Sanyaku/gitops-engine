@@ -1439,9 +1439,9 @@ func TestBuildGraphWithMissingRefs(t *testing.T) {
 		child.ResourceKey(): child,
 	}
 
-	// Call buildGraphWithMissingRefs with nil allResources to collect missing refs
+	// Call buildGraphWithMissingRefs to collect missing refs
 	var missingRefs []missingOwnerRef
-	graph := buildGraphWithMissingRefs(nsNodes, nil, &missingRefs)
+	graph := buildGraphWithMissingRefs(nsNodes, &missingRefs)
 
 	// Should collect one missing owner reference
 	assert.Len(t, missingRefs, 1, "Should collect one missing owner reference")

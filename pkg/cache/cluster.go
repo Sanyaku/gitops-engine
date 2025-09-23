@@ -1099,7 +1099,7 @@ func (c *clusterCache) IterateHierarchyV2(keys []kube.ResourceKey, action func(r
 		
 		// For regular namespaces, collect missing owner references during graph building
 		// Reuse the same slice to minimize allocations
-		graph := buildGraphWithMissingRefs(nsNodes, nil, &missingRefs)
+		graph := buildGraphWithMissingRefs(nsNodes, &missingRefs)
 		
 		c.processNamespaceHierarchy(namespaceKeys, nsNodes, graph, action)
 	}
@@ -1162,7 +1162,7 @@ func (c *clusterCache) processNamespaceHierarchy(namespaceKeys []kube.ResourceKe
 
 // buildGraphWithMissingRefs builds a resource graph but collects missing owner references instead of resolving them
 // Optimized version to minimize allocations and improve cache locality
-func buildGraphWithMissingRefs(nsNodes map[kube.ResourceKey]*Resource, allResources map[kube.ResourceKey]*Resource, missingRefs *[]missingOwnerRef) map[kube.ResourceKey]map[types.UID]*Resource {
+func buildGraphWithMissingRefs(nsNodes map[kube.ResourceKey]*Resource, missingRefs *[]missingOwnerRef) map[kube.ResourceKey]map[types.UID]*Resource {
 	// Prepare to construct a graph
 	nodesByUID := make(map[types.UID][]*Resource, len(nsNodes))
 	for _, node := range nsNodes {
@@ -1186,8 +1186,8 @@ func buildGraphWithMissingRefs(nsNodes map[kube.ResourceKey]*Resource, allResour
 				sameNSKey := kube.ResourceKey{Group: group.Group, Kind: ownerRef.Kind, Namespace: childNode.Ref.Namespace, Name: ownerRef.Name}
 				graphKeyNode, ok := nsNodes[sameNSKey]
 
-				// If not found and we need cluster-scoped lookup, collect as missing reference
-				if !ok && allResources == nil {
+				// If not found, collect as missing reference for later batch resolution
+				if !ok {
 					// Collect this as a missing owner reference for later batch resolution
 					clusterScopedKey := kube.ResourceKey{Group: group.Group, Kind: ownerRef.Kind, Namespace: "", Name: ownerRef.Name}
 					*missingRefs = append(*missingRefs, missingOwnerRef{
@@ -1196,15 +1196,6 @@ func buildGraphWithMissingRefs(nsNodes map[kube.ResourceKey]*Resource, allResour
 						parentKey:     clusterScopedKey,
 					})
 					continue
-				} else if !ok && allResources != nil {
-					// If we have allResources, try cluster-scoped lookup
-					clusterScopedKey := kube.ResourceKey{Group: group.Group, Kind: ownerRef.Kind, Namespace: "", Name: ownerRef.Name}
-					graphKeyNode, ok = allResources[clusterScopedKey]
-				}
-
-				if !ok {
-					// No resource found with the given graph key, so move on.
-					continue
 				}
 				ownerRef.UID = graphKeyNode.Ref.UID
 				childNode.OwnerRefs[i] = ownerRef
@@ -1212,18 +1203,6 @@ func buildGraphWithMissingRefs(nsNodes map[kube.ResourceKey]*Resource, allResour
 
 			// Now that we have the UID of the parent, update the graph.
 			uidNodes, ok := nodesByUID[ownerRef.UID]
-			if !ok && allResources != nil {
-				// If parent not found in current namespace, check if it exists in allResources
-				// and create a temporary uidNodes list for cluster-scoped parent relationships
-				for _, parentCandidate := range allResources {
-					if parentCandidate.Ref.UID == ownerRef.UID {
-						uidNodes = []*Resource{parentCandidate}
-						ok = true
-						break
-					}
-				}
-			}
-
 			if ok {
 				for _, uidNode := range uidNodes {
 					// Update the graph for this owner to include the child.
