@@ -1414,7 +1414,7 @@ func TestIterateHierarchyV2_BatchedMissingOwnerRefResolution(t *testing.T) {
 	assert.True(t, foundChild2, "Should visit namespaced child 2")
 }
 
-// TestBuildGraphWithMissingRefs tests the new buildGraphWithMissingRefs function
+// TestBuildGraphWithMissingRefs tests the buildGraph function with missing refs collection
 func TestBuildGraphWithMissingRefs(t *testing.T) {
 	// Create resources for testing
 	childUID := types.UID("child-456")
@@ -1439,9 +1439,9 @@ func TestBuildGraphWithMissingRefs(t *testing.T) {
 		child.ResourceKey(): child,
 	}
 
-	// Call buildGraphWithMissingRefs to collect missing refs
+	// Call buildGraph to collect missing refs
 	var missingRefs []missingOwnerRef
-	graph := buildGraphWithMissingRefs(nsNodes, &missingRefs)
+	graph := buildGraph(nsNodes, nil, &missingRefs)
 
 	// Should collect one missing owner reference
 	assert.Len(t, missingRefs, 1, "Should collect one missing owner reference")
@@ -1509,7 +1509,7 @@ func TestIterateHierarchyV2_ExactPerformanceAccounting(t *testing.T) {
 	t.Logf("Expected performance characteristics:")
 	t.Logf("- Input: 3 keys (2 namespaced children + 1 cluster parent)")
 	t.Logf("- Regular namespaces processed: 2 (ns-1, ns-2)")
-	t.Logf("- buildGraphWithMissingRefs calls: 2 (once per regular namespace)")
+	t.Logf("- buildGraph (with missingRefs) calls: 2 (once per regular namespace)")
 	t.Logf("- Missing refs collected: 2 (one from each child)")
 	t.Logf("- Cluster-scoped processed: true")
 	t.Logf("- buildGraph calls: 1 (for cluster-scoped namespace)")
@@ -1669,7 +1669,7 @@ func TestBuildGraph_NilAllResources(t *testing.T) {
 	h.createParent("test-ns")
 	h.createChild(h.standardOwnerRef())
 
-	graph := buildGraph(h.nsNodes(), nil)
+	graph := buildGraph(h.nsNodes(), nil, nil)
 	h.assertParentChildRelationship(t, graph)
 }
 
@@ -1678,7 +1678,7 @@ func TestBuildGraph_InvalidAPIVersion(t *testing.T) {
 	h := newBuildGraphTestHelper()
 	h.createChild(h.invalidOwnerRef())
 
-	graph := buildGraph(h.nsNodes(), h.allResources())
+	graph := buildGraph(h.nsNodes(), h.allResources(), nil)
 	h.assertEmptyGraph(t, graph)
 }
 
@@ -1694,7 +1694,7 @@ func TestBuildGraph_CrossNamespaceMissingUID(t *testing.T) {
 	}
 	nsNodes := map[kube.ResourceKey]*Resource{h.child.ResourceKey(): h.child}
 
-	graph := buildGraph(nsNodes, allResources)
+	graph := buildGraph(nsNodes, allResources, nil)
 	h.assertParentChildRelationship(t, graph)
 	h.assertUIDBackfilled(t)
 }
@@ -1707,7 +1707,7 @@ func TestBuildGraph_NonExistentParent(t *testing.T) {
 	}
 	h.createChild(nonExistentOwnerRef)
 
-	graph := buildGraph(h.nsNodes(), h.allResources())
+	graph := buildGraph(h.nsNodes(), h.allResources(), nil)
 	h.assertEmptyGraph(t, graph)
 }
 
@@ -1723,7 +1723,7 @@ func TestBuildGraph_CrossNamespaceUIDLookup(t *testing.T) {
 		h.child.ResourceKey():  h.child,
 	}
 
-	graph := buildGraph(nsNodes, allResources)
+	graph := buildGraph(nsNodes, allResources, nil)
 	h.assertParentChildRelationship(t, graph)
 }
 
@@ -1762,7 +1762,7 @@ func TestBuildGraph_DuplicateUIDs(t *testing.T) {
 		child2.ResourceKey():   child2,
 	}
 
-	graph := buildGraph(nsNodes, nil)
+	graph := buildGraph(nsNodes, nil, nil)
 
 	assert.Contains(t, graph, h.parent.ResourceKey())
 	assert.Contains(t, graph[h.parent.ResourceKey()], duplicateUID)
@@ -1909,7 +1909,7 @@ func BenchmarkBuildGraph(b *testing.B) {
 	testResources := buildTestResourceMap()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		buildGraph(testResources, nil)
+		buildGraph(testResources, nil, nil)
 	}
 }
 
