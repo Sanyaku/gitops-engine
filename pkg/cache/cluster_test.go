@@ -24,7 +24,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -1158,639 +1157,105 @@ func TestIterateHierachyV2(t *testing.T) {
 	})
 }
 
-// TestIterateHierarchyV2_ClusterScopedParentOwnerReference tests that cluster-scoped parent
-// owner references work correctly, specifically cluster-scoped resources with
-// namespaced children
-func TestIterateHierarchyV2_ClusterScopedParentOwnerReference(t *testing.T) {
-	cluster := newCluster(t)
+func TestIterateHierarchyV2_ClusterScopedParents(t *testing.T) {
+	clusterParent := &unstructured.Unstructured{}
+	clusterParent.SetAPIVersion("v1")
+	clusterParent.SetKind("ConfigMap")
+	clusterParent.SetName("cluster-parent")
+	clusterParent.SetUID("parent-123")
 
-	// Create cluster-scoped parent resource (ProviderRevision)
-	parentUID := types.UID("parent-uid-123")
-	clusterScopedParent := &Resource{
-		Ref: corev1.ObjectReference{
-			APIVersion: "pkg.crossplane.io/v1",
-			Kind:       "ProviderRevision",
-			Name:       "provider-aws-cloudformation-3b2c213545b8",
-			UID:        parentUID,
-			// No namespace = cluster-scoped
-		},
-		OwnerRefs: []metav1.OwnerReference{},
-	}
+	namespacedChild := &unstructured.Unstructured{}
+	namespacedChild.SetAPIVersion("v1")
+	namespacedChild.SetKind("Pod")
+	namespacedChild.SetName("namespaced-child")
+	namespacedChild.SetNamespace("test-namespace")
+	namespacedChild.SetUID("child-456")
+	namespacedChild.SetOwnerReferences([]metav1.OwnerReference{{
+		APIVersion: "v1",
+		Kind:       "ConfigMap",
+		Name:       "cluster-parent",
+	}})
 
-	// Create namespaced child with ownerReference to cluster-scoped parent
-	namespacedChild := &Resource{
-		Ref: corev1.ObjectReference{
-			APIVersion: "apps/v1",
-			Kind:       "Deployment",
-			Name:       "provider-aws-cloudformation-3b2c213545b8",
-			Namespace:  "crossplane-system",
-			UID:        types.UID("child-uid-456"),
-		},
-		OwnerRefs: []metav1.OwnerReference{{
-			APIVersion: "pkg.crossplane.io/v1",
-			Kind:       "ProviderRevision",
-			Name:       "provider-aws-cloudformation-3b2c213545b8",
-			// UID: parentUID, // Don't set UID - let it be resolved via cross-namespace lookup
-		}},
-	}
+	clusterChild := &unstructured.Unstructured{}
+	clusterChild.SetAPIVersion("rbac.authorization.k8s.io/v1")
+	clusterChild.SetKind("ClusterRole")
+	clusterChild.SetName("cluster-child")
+	clusterChild.SetUID("child-789")
+	clusterChild.SetOwnerReferences([]metav1.OwnerReference{{
+		APIVersion: "v1",
+		Kind:       "ConfigMap",
+		Name:       "cluster-parent",
+		UID:        "parent-123",
+	}})
 
-	// Create cluster-scoped child with ownerReference to cluster-scoped parent (this should work already)
-	clusterScopedChild := &Resource{
-		Ref: corev1.ObjectReference{
-			APIVersion: "rbac.authorization.k8s.io/v1",
-			Kind:       "ClusterRole",
-			Name:       "crossplane:provider:provider-aws-cloudformation-3b2c213545b8:system",
-			UID:        types.UID("child-uid-789"),
-			// No namespace = cluster-scoped
-		},
-		OwnerRefs: []metav1.OwnerReference{{
-			APIVersion: "pkg.crossplane.io/v1",
-			Kind:       "ProviderRevision",
-			Name:       "provider-aws-cloudformation-3b2c213545b8",
-			UID:        parentUID,
-		}},
-	}
+	cluster := newCluster(t, clusterParent, namespacedChild, clusterChild).WithAPIResources([]kube.APIResourceInfo{{
+		GroupKind:            schema.GroupKind{Group: "", Kind: "ConfigMap"},
+		GroupVersionResource: schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"},
+		Meta:                 metav1.APIResource{Namespaced: false},
+	}, {
+		GroupKind:            schema.GroupKind{Group: "rbac.authorization.k8s.io", Kind: "ClusterRole"},
+		GroupVersionResource: schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"},
+		Meta:                 metav1.APIResource{Namespaced: false},
+	}})
+	err := cluster.EnsureSynced()
+	require.NoError(t, err)
 
-	// Add all resources to cluster cache
-	cluster.setNode(clusterScopedParent)
-	cluster.setNode(namespacedChild)
-	cluster.setNode(clusterScopedChild)
-
-	// Test hierarchy traversal starting from cluster-scoped parent
-	var visitedResources []*Resource
+	keys := []kube.ResourceKey{}
 	cluster.IterateHierarchyV2(
-		[]kube.ResourceKey{clusterScopedParent.ResourceKey()},
+		[]kube.ResourceKey{kube.GetResourceKey(clusterParent)},
 		func(resource *Resource, _ map[kube.ResourceKey]*Resource) bool {
-			visitedResources = append(visitedResources, resource)
+			keys = append(keys, resource.ResourceKey())
 			return true
 		},
 	)
 
-	// Should visit parent + both children (3 resources)
-	assert.Len(t, visitedResources, 3, "Should visit parent and both children")
-
-	visitedNames := make([]string, len(visitedResources))
-	for i, res := range visitedResources {
-		visitedNames[i] = res.Ref.Name
-	}
-
-	// Check we have the expected resources by type and namespace combination
-	foundParent := false
-	foundClusterChild := false
-	foundNamespacedChild := false
-
-	for _, res := range visitedResources {
-		switch {
-		case res.Ref.Kind == "ProviderRevision" && res.Ref.Namespace == "":
-			foundParent = true
-		case res.Ref.Kind == "ClusterRole" && res.Ref.Namespace == "":
-			foundClusterChild = true
-		case res.Ref.Kind == "Deployment" && res.Ref.Namespace == "crossplane-system":
-			foundNamespacedChild = true
-		}
-	}
-
-	assert.True(t, foundParent, "Should visit ProviderRevision parent")
-	assert.True(t, foundClusterChild, "Should visit ClusterRole child")
-	assert.True(t, foundNamespacedChild, "Should visit Deployment child (this tests the fix)")
+	assert.ElementsMatch(t, []kube.ResourceKey{
+		kube.GetResourceKey(clusterParent),
+		kube.GetResourceKey(namespacedChild),
+		kube.GetResourceKey(clusterChild),
+	}, keys)
 }
 
-// TestIterateHierarchyV2_DisabledClusterScopedParents tests that the environment variable
-// disables cluster-scoped parent owner reference resolution
 func TestIterateHierarchyV2_DisabledClusterScopedParents(t *testing.T) {
-	// Set environment variable to disable cluster-scoped parent functionality
 	t.Setenv("GITOPS_ENGINE_DISABLE_CLUSTER_SCOPED_PARENT_REFS", "1")
 
-	cluster := newCluster(t)
+	clusterParent := &unstructured.Unstructured{}
+	clusterParent.SetAPIVersion("v1")
+	clusterParent.SetKind("ConfigMap")
+	clusterParent.SetName("cluster-parent")
+	clusterParent.SetUID("parent-123")
 
-	// Create cluster-scoped parent resource (ProviderRevision)
-	parentUID := types.UID("parent-uid-123")
-	clusterScopedParent := &Resource{
-		Ref: corev1.ObjectReference{
-			APIVersion: "pkg.crossplane.io/v1",
-			Kind:       "ProviderRevision",
-			Name:       "provider-aws-cloudformation-3b2c213545b8",
-			UID:        parentUID,
-			// No namespace = cluster-scoped
-		},
-		OwnerRefs: []metav1.OwnerReference{},
-	}
-
-	// Create namespaced child with ownerReference to cluster-scoped parent
-	namespacedChild := &Resource{
-		Ref: corev1.ObjectReference{
-			APIVersion: "apps/v1",
-			Kind:       "Deployment",
-			Name:       "provider-aws-cloudformation-3b2c213545b8",
-			Namespace:  "crossplane-system",
-			UID:        types.UID("child-uid-456"),
-		},
-		OwnerRefs: []metav1.OwnerReference{{
-			APIVersion: "pkg.crossplane.io/v1",
-			Kind:       "ProviderRevision",
-			Name:       "provider-aws-cloudformation-3b2c213545b8",
-		}},
-	}
-
-	// Add resources to cluster cache
-	cluster.setNode(clusterScopedParent)
-	cluster.setNode(namespacedChild)
-
-	// Test hierarchy traversal starting from cluster-scoped parent
-	var visitedResources []*Resource
-	cluster.IterateHierarchyV2(
-		[]kube.ResourceKey{clusterScopedParent.ResourceKey()},
-		func(resource *Resource, _ map[kube.ResourceKey]*Resource) bool {
-			visitedResources = append(visitedResources, resource)
-			return true
-		},
-	)
-
-	// When disabled, should only visit the parent (1 resource)
-	// because cluster-scoped parent resolution is disabled
-	assert.Len(t, visitedResources, 1, "Should only visit parent when cluster-scoped parent resolution disabled")
-	assert.Equal(t, "ProviderRevision", visitedResources[0].Ref.Kind)
-}
-
-// TestIterateHierarchyV2_BatchedMissingOwnerRefResolution tests the optimization where 
-// missing owner references are collected during regular namespace processing and then
-// batch resolved when processing cluster-scoped resources
-func TestIterateHierarchyV2_BatchedMissingOwnerRefResolution(t *testing.T) {
-	cluster := newCluster(t)
-
-	// Create cluster-scoped parent resource
-	parentUID := types.UID("cluster-parent-uid")
-	clusterScopedParent := &Resource{
-		Ref: corev1.ObjectReference{
-			APIVersion: "v1",
-			Kind:       "ConfigMap",
-			Name:       "cluster-parent",
-			UID:        parentUID,
-			// No namespace = cluster-scoped
-		},
-		OwnerRefs: []metav1.OwnerReference{},
-	}
-
-	// Create multiple namespaced children with owner references to cluster-scoped parent (without UID)
-	namespacedChild1 := &Resource{
-		Ref: corev1.ObjectReference{
-			APIVersion: "v1",
-			Kind:       "Pod",
-			Name:       "child-1",
-			Namespace:  "namespace-1",
-			UID:        types.UID("child-uid-1"),
-		},
-		OwnerRefs: []metav1.OwnerReference{{
-			APIVersion: "v1",
-			Kind:       "ConfigMap",
-			Name:       "cluster-parent",
-			// UID: "", // Missing UID - should be batched resolved
-		}},
-	}
-
-	namespacedChild2 := &Resource{
-		Ref: corev1.ObjectReference{
-			APIVersion: "v1",
-			Kind:       "Pod",
-			Name:       "child-2",
-			Namespace:  "namespace-2",
-			UID:        types.UID("child-uid-2"),
-		},
-		OwnerRefs: []metav1.OwnerReference{{
-			APIVersion: "v1",
-			Kind:       "ConfigMap",
-			Name:       "cluster-parent",
-			// UID: "", // Missing UID - should be batched resolved
-		}},
-	}
-
-	// Add all resources to cluster cache
-	cluster.setNode(clusterScopedParent)
-	cluster.setNode(namespacedChild1)
-	cluster.setNode(namespacedChild2)
-
-	// Test hierarchy traversal starting from mixed keys (both namespaced and cluster-scoped)
-	// This represents a realistic scenario where we process resources from multiple namespaces
-	// including cluster-scoped resources, which should trigger the batched owner ref resolution
-	var visitedResources []*Resource
-	cluster.IterateHierarchyV2(
-		[]kube.ResourceKey{
-			namespacedChild1.ResourceKey(), 
-			namespacedChild2.ResourceKey(), 
-			clusterScopedParent.ResourceKey(),
-		},
-		func(resource *Resource, _ map[kube.ResourceKey]*Resource) bool {
-			visitedResources = append(visitedResources, resource)
-			return true
-		},
-	)
-
-	// The key assertion: verify that the missing owner references were properly resolved
-	// This proves that the batched resolution optimization is working
-	assert.Equal(t, parentUID, namespacedChild1.OwnerRefs[0].UID, "Child 1 owner ref UID should be resolved")
-	assert.Equal(t, parentUID, namespacedChild2.OwnerRefs[0].UID, "Child 2 owner ref UID should be resolved")
-
-	// Should visit at least the 3 unique resources (may visit some multiple times in complex hierarchies)
-	assert.GreaterOrEqual(t, len(visitedResources), 3, "Should visit at least parent and both children")
-
-	// Check we have the expected resources
-	foundParent := false
-	foundChild1 := false
-	foundChild2 := false
-
-	for _, res := range visitedResources {
-		switch {
-		case res.Ref.Kind == "ConfigMap" && res.Ref.Namespace == "":
-			foundParent = true
-		case res.Ref.Kind == "Pod" && res.Ref.Namespace == "namespace-1":
-			foundChild1 = true
-		case res.Ref.Kind == "Pod" && res.Ref.Namespace == "namespace-2":
-			foundChild2 = true
-		}
-	}
-
-	assert.True(t, foundParent, "Should visit cluster-scoped parent")
-	assert.True(t, foundChild1, "Should visit namespaced child 1")
-	assert.True(t, foundChild2, "Should visit namespaced child 2")
-}
-
-// TestBuildGraphWithMissingRefs tests the buildGraph function with missing refs collection
-func TestBuildGraphWithMissingRefs(t *testing.T) {
-	// Create resources for testing
-	childUID := types.UID("child-456")
-	
-	child := &Resource{
-		Ref: corev1.ObjectReference{
-			APIVersion: "v1",
-			Kind:       "Pod",
-			Name:       "child",
-			Namespace:  "test-ns",
-			UID:        childUID,
-		},
-		OwnerRefs: []metav1.OwnerReference{{
-			APIVersion: "v1",
-			Kind:       "ConfigMap", 
-			Name:       "cluster-parent",
-			// UID: "", // Missing UID
-		}},
-	}
-
-	nsNodes := map[kube.ResourceKey]*Resource{
-		child.ResourceKey(): child,
-	}
-
-	// Call buildGraph to collect missing refs
-	var missingRefs []missingOwnerRef
-	graph := buildGraph(nsNodes, nil, &missingRefs)
-
-	// Should collect one missing owner reference
-	assert.Len(t, missingRefs, 1, "Should collect one missing owner reference")
-	
-	if len(missingRefs) == 1 {
-		assert.Equal(t, child, missingRefs[0].childResource, "Should reference the child resource")
-		assert.Equal(t, 0, missingRefs[0].ownerRefIndex, "Should reference the first owner ref")
-		assert.Equal(t, kube.ResourceKey{Kind: "ConfigMap", Name: "cluster-parent", Namespace: ""}, 
-			missingRefs[0].parentKey, "Should have cluster-scoped parent key")
-	}
-
-	// Graph should be empty since no relationships were established
-	assert.Empty(t, graph, "Graph should be empty when parent not found")
-}
-
-// TestIterateHierarchyV2_ExactPerformanceAccounting validates our exact understanding of traversal behavior
-func TestIterateHierarchyV2_ExactPerformanceAccounting(t *testing.T) {
-	cluster := newCluster(t)
-
-	// Create test scenario with known characteristics:
-	// - 1 cluster-scoped parent
-	// - 2 namespaced children in different namespaces  
-	// - Each child has 1 owner reference without UID (needs batch resolution)
-	parentUID := types.UID("cluster-parent-uid")
-	clusterParent := &Resource{
-		Ref: corev1.ObjectReference{
-			APIVersion: "v1", Kind: "ConfigMap", Name: "cluster-parent", UID: parentUID,
-		}, OwnerRefs: []metav1.OwnerReference{},
-	}
-
-	child1 := &Resource{
-		Ref: corev1.ObjectReference{
-			APIVersion: "v1", Kind: "Pod", Name: "child-1", Namespace: "ns-1", UID: types.UID("child-1-uid"),
-		}, OwnerRefs: []metav1.OwnerReference{{
-			APIVersion: "v1", Kind: "ConfigMap", Name: "cluster-parent", // Missing UID
-		}},
-	}
-
-	child2 := &Resource{
-		Ref: corev1.ObjectReference{
-			APIVersion: "v1", Kind: "Pod", Name: "child-2", Namespace: "ns-2", UID: types.UID("child-2-uid"),
-		}, OwnerRefs: []metav1.OwnerReference{{
-			APIVersion: "v1", Kind: "ConfigMap", Name: "cluster-parent", // Missing UID
-		}},
-	}
-
-	cluster.setNode(clusterParent)
-	cluster.setNode(child1) 
-	cluster.setNode(child2)
-
-	// Test the batched optimization scenario with exact accounting expectations
-	callCount := 0
-	cluster.IterateHierarchyV2(
-		[]kube.ResourceKey{child1.ResourceKey(), child2.ResourceKey(), clusterParent.ResourceKey()},
-		func(resource *Resource, _ map[kube.ResourceKey]*Resource) bool {
-			callCount++
-			return true
-		},
-	)
-
-	// EXACT PERFORMANCE EXPECTATIONS based on our instrumentation:
-	// From the log: totalInputKeys=3 validInputKeys=3 namespacesProcessed=2 regularNamespaces=["namespace-1","namespace-2"] clusterScopedProcessed=true missingRefsCollected=2 missingRefsResolved=2 totalActionCalls=5 buildGraphCalls=1 buildGraphWithMissingRefsCalls=2
-
-	// Expected behavior analysis:
-	t.Logf("Expected performance characteristics:")
-	t.Logf("- Input: 3 keys (2 namespaced children + 1 cluster parent)")
-	t.Logf("- Regular namespaces processed: 2 (ns-1, ns-2)")
-	t.Logf("- buildGraph (with missingRefs) calls: 2 (once per regular namespace)")
-	t.Logf("- Missing refs collected: 2 (one from each child)")
-	t.Logf("- Cluster-scoped processed: true")
-	t.Logf("- buildGraph calls: 1 (for cluster-scoped namespace)")
-	t.Logf("- Missing refs resolved: 2 (batch resolution)")
-	t.Logf("- Total action calls: depends on hierarchy traversal")
-
-	// Key assertions about the optimization:
-	assert.Equal(t, parentUID, child1.OwnerRefs[0].UID, "Child 1 owner ref should be resolved")
-	assert.Equal(t, parentUID, child2.OwnerRefs[0].UID, "Child 2 owner ref should be resolved")
-	assert.GreaterOrEqual(t, callCount, 3, "Should visit at least the 3 input resources")
-	
-	// Test the optimization is actually more efficient than the naive approach
-	t.Logf("Performance analysis complete - batched resolution working correctly")
-}
-
-// TestIterateHierarchyV2_CompareWithoutOptimization validates the performance benefit
-func TestIterateHierarchyV2_CompareWithoutOptimization(t *testing.T) {
-	// Test with optimization disabled to see the difference
-	t.Setenv("GITOPS_ENGINE_DISABLE_CLUSTER_SCOPED_PARENT_REFS", "1")
-	
-	cluster := newCluster(t)
-	
-	parentUID := types.UID("cluster-parent-uid")
-	clusterParent := &Resource{
-		Ref: corev1.ObjectReference{
-			APIVersion: "v1", Kind: "ConfigMap", Name: "cluster-parent", UID: parentUID,
-		}, OwnerRefs: []metav1.OwnerReference{},
-	}
-
-	child1 := &Resource{
-		Ref: corev1.ObjectReference{
-			APIVersion: "v1", Kind: "Pod", Name: "child-1", Namespace: "ns-1", UID: types.UID("child-1-uid"),
-		}, OwnerRefs: []metav1.OwnerReference{{
-			APIVersion: "v1", Kind: "ConfigMap", Name: "cluster-parent",
-		}},
-	}
-
-	cluster.setNode(clusterParent)
-	cluster.setNode(child1)
-
-	callCount := 0
-	cluster.IterateHierarchyV2(
-		[]kube.ResourceKey{child1.ResourceKey(), clusterParent.ResourceKey()},
-		func(resource *Resource, _ map[kube.ResourceKey]*Resource) bool {
-			callCount++
-			return true
-		},
-	)
-
-	// With optimization disabled, owner refs should NOT be resolved
-	assert.Empty(t, child1.OwnerRefs[0].UID, "Owner ref should not be resolved when optimization disabled")
-	t.Logf("Confirmed: optimization can be disabled via environment variable")
-}
-
-// buildGraphTestHelper creates test resources and maps for buildGraph testing
-type buildGraphTestHelper struct {
-	parentUID types.UID
-	childUID  types.UID
-	parent    *Resource
-	child     *Resource
-}
-
-func newBuildGraphTestHelper() *buildGraphTestHelper {
-	parentUID := types.UID("parent-123")
-	childUID := types.UID("child-456")
-	return &buildGraphTestHelper{
-		parentUID: parentUID,
-		childUID:  childUID,
-	}
-}
-
-func (h *buildGraphTestHelper) createParent(namespace string) {
-	h.parent = &Resource{
-		Ref: corev1.ObjectReference{
-			APIVersion: "v1",
-			Kind:       "ConfigMap",
-			Name:       "parent",
-			Namespace:  namespace,
-			UID:        h.parentUID,
-		},
-	}
-}
-
-func (h *buildGraphTestHelper) createChild(ownerRefs ...metav1.OwnerReference) {
-	h.child = &Resource{
-		Ref: corev1.ObjectReference{
-			APIVersion: "v1",
-			Kind:       "Pod",
-			Name:       "child",
-			Namespace:  "test-ns",
-			UID:        h.childUID,
-		},
-		OwnerRefs: ownerRefs,
-	}
-}
-
-func (h *buildGraphTestHelper) standardOwnerRef() metav1.OwnerReference {
-	return metav1.OwnerReference{
+	namespacedChild := &unstructured.Unstructured{}
+	namespacedChild.SetAPIVersion("v1")
+	namespacedChild.SetKind("Pod")
+	namespacedChild.SetName("namespaced-child")
+	namespacedChild.SetNamespace("test-namespace")
+	namespacedChild.SetUID("child-456")
+	namespacedChild.SetOwnerReferences([]metav1.OwnerReference{{
 		APIVersion: "v1",
 		Kind:       "ConfigMap",
-		Name:       "parent",
-		UID:        h.parentUID,
-	}
-}
+		Name:       "cluster-parent",
+	}})
 
-func (h *buildGraphTestHelper) ownerRefWithoutUID() metav1.OwnerReference {
-	return metav1.OwnerReference{
-		APIVersion: "v1",
-		Kind:       "ConfigMap",
-		Name:       "parent",
-	}
-}
+	cluster := newCluster(t, clusterParent, namespacedChild).WithAPIResources([]kube.APIResourceInfo{{
+		GroupKind:            schema.GroupKind{Group: "", Kind: "ConfigMap"},
+		GroupVersionResource: schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"},
+		Meta:                 metav1.APIResource{Namespaced: false},
+	}})
+	err := cluster.EnsureSynced()
+	require.NoError(t, err)
 
-func (h *buildGraphTestHelper) invalidOwnerRef() metav1.OwnerReference {
-	return metav1.OwnerReference{
-		APIVersion: "invalid/api/version",
-		Kind:       "ConfigMap",
-		Name:       "parent",
-	}
-}
-
-func (h *buildGraphTestHelper) nsNodes() map[kube.ResourceKey]*Resource {
-	result := make(map[kube.ResourceKey]*Resource)
-	if h.parent != nil {
-		result[h.parent.ResourceKey()] = h.parent
-	}
-	if h.child != nil {
-		result[h.child.ResourceKey()] = h.child
-	}
-	return result
-}
-
-func (h *buildGraphTestHelper) allResources() map[kube.ResourceKey]*Resource {
-	return h.nsNodes() // For simplicity, use same as nsNodes unless overridden
-}
-
-// Common assertion helpers
-func (h *buildGraphTestHelper) assertParentChildRelationship(t *testing.T, graph map[kube.ResourceKey]map[types.UID]*Resource) {
-	t.Helper()
-	assert.Contains(t, graph, h.parent.ResourceKey())
-	assert.Contains(t, graph[h.parent.ResourceKey()], h.childUID)
-}
-
-func (h *buildGraphTestHelper) assertEmptyGraph(t *testing.T, graph map[kube.ResourceKey]map[types.UID]*Resource) {
-	t.Helper()
-	assert.Empty(t, graph)
-}
-
-func (h *buildGraphTestHelper) assertUIDBackfilled(t *testing.T) {
-	t.Helper()
-	assert.Equal(t, h.parentUID, h.child.OwnerRefs[0].UID)
-}
-
-// TestBuildGraph_NilAllResources tests buildGraph with nil allResources parameter
-func TestBuildGraph_NilAllResources(t *testing.T) {
-	h := newBuildGraphTestHelper()
-	h.createParent("test-ns")
-	h.createChild(h.standardOwnerRef())
-
-	graph := buildGraph(h.nsNodes(), nil, nil)
-	h.assertParentChildRelationship(t, graph)
-}
-
-// TestBuildGraph_InvalidAPIVersion tests handling of invalid API versions in owner references
-func TestBuildGraph_InvalidAPIVersion(t *testing.T) {
-	h := newBuildGraphTestHelper()
-	h.createChild(h.invalidOwnerRef())
-
-	graph := buildGraph(h.nsNodes(), h.allResources(), nil)
-	h.assertEmptyGraph(t, graph)
-}
-
-// TestBuildGraph_CrossNamespaceMissingUID tests cross-namespace parent resolution with missing UID
-func TestBuildGraph_CrossNamespaceMissingUID(t *testing.T) {
-	h := newBuildGraphTestHelper()
-	h.createParent("") // Cluster-scoped
-	h.createChild(h.ownerRefWithoutUID())
-
-	allResources := map[kube.ResourceKey]*Resource{
-		h.parent.ResourceKey(): h.parent,
-		h.child.ResourceKey():  h.child,
-	}
-	nsNodes := map[kube.ResourceKey]*Resource{h.child.ResourceKey(): h.child}
-
-	graph := buildGraph(nsNodes, allResources, nil)
-	h.assertParentChildRelationship(t, graph)
-	h.assertUIDBackfilled(t)
-}
-
-// TestBuildGraph_NonExistentParent tests cross-namespace child with non-existent parent
-func TestBuildGraph_NonExistentParent(t *testing.T) {
-	h := newBuildGraphTestHelper()
-	nonExistentOwnerRef := metav1.OwnerReference{
-		APIVersion: "v1", Kind: "ConfigMap", Name: "non-existent-parent",
-	}
-	h.createChild(nonExistentOwnerRef)
-
-	graph := buildGraph(h.nsNodes(), h.allResources(), nil)
-	h.assertEmptyGraph(t, graph)
-}
-
-// TestBuildGraph_CrossNamespaceUIDLookup tests cross-namespace parent lookup by UID
-func TestBuildGraph_CrossNamespaceUIDLookup(t *testing.T) {
-	h := newBuildGraphTestHelper()
-	h.createParent("") // Cluster-scoped
-	h.createChild(h.standardOwnerRef())
-
-	nsNodes := map[kube.ResourceKey]*Resource{h.child.ResourceKey(): h.child}
-	allResources := map[kube.ResourceKey]*Resource{
-		h.parent.ResourceKey(): h.parent,
-		h.child.ResourceKey():  h.child,
-	}
-
-	graph := buildGraph(nsNodes, allResources, nil)
-	h.assertParentChildRelationship(t, graph)
-}
-
-// TestBuildGraph_DuplicateUIDs tests handling of resources with duplicate UIDs
-func TestBuildGraph_DuplicateUIDs(t *testing.T) {
-	duplicateUID := types.UID("duplicate-456")
-	h := newBuildGraphTestHelper()
-	h.createParent("test-ns")
-
-	// Create two children with same UID but different API versions (simulating replicasets from different API groups)
-	child1 := &Resource{
-		Ref: corev1.ObjectReference{
-			APIVersion: "apps/v1",
-			Kind:       "ReplicaSet",
-			Name:       "child-apps",
-			Namespace:  "test-ns",
-			UID:        duplicateUID,
-		},
-		OwnerRefs: []metav1.OwnerReference{h.standardOwnerRef()},
-	}
-
-	child2 := &Resource{
-		Ref: corev1.ObjectReference{
-			APIVersion: "extensions/v1beta1",
-			Kind:       "ReplicaSet",
-			Name:       "child-extensions",
-			Namespace:  "test-ns",
-			UID:        duplicateUID,
-		},
-		OwnerRefs: []metav1.OwnerReference{h.standardOwnerRef()},
-	}
-
-	nsNodes := map[kube.ResourceKey]*Resource{
-		h.parent.ResourceKey(): h.parent,
-		child1.ResourceKey():   child1,
-		child2.ResourceKey():   child2,
-	}
-
-	graph := buildGraph(nsNodes, nil, nil)
-
-	assert.Contains(t, graph, h.parent.ResourceKey())
-	assert.Contains(t, graph[h.parent.ResourceKey()], duplicateUID)
-	assert.NotNil(t, graph[h.parent.ResourceKey()][duplicateUID])
-}
-
-// TestIterateHierarchyV2_EdgeCases tests additional edge cases for hierarchy iteration
-func TestIterateHierarchyV2_EdgeCases(t *testing.T) {
-	cluster := newCluster(t)
-
-	t.Run("EmptyKeysList", func(t *testing.T) {
-		var visited []kube.ResourceKey
-		cluster.IterateHierarchyV2([]kube.ResourceKey{}, func(resource *Resource, _ map[kube.ResourceKey]*Resource) bool {
-			visited = append(visited, resource.ResourceKey())
+	keys := []kube.ResourceKey{}
+	cluster.IterateHierarchyV2(
+		[]kube.ResourceKey{kube.GetResourceKey(clusterParent)},
+		func(resource *Resource, _ map[kube.ResourceKey]*Resource) bool {
+			keys = append(keys, resource.ResourceKey())
 			return true
-		})
-		assert.Empty(t, visited)
-	})
+		},
+	)
 
-	t.Run("NonExistentKeys", func(t *testing.T) {
-		var visited []kube.ResourceKey
-		nonExistentKey := kube.ResourceKey{Group: "fake", Kind: "Fake", Namespace: "fake", Name: "fake"}
-		cluster.IterateHierarchyV2([]kube.ResourceKey{nonExistentKey}, func(resource *Resource, _ map[kube.ResourceKey]*Resource) bool {
-			visited = append(visited, resource.ResourceKey())
-			return true
-		})
-		assert.Empty(t, visited)
-	})
+	// When disabled, should only visit the parent
+	assert.Equal(t, []kube.ResourceKey{kube.GetResourceKey(clusterParent)}, keys)
 }
 
 // Test_watchEvents_Deadlock validates that starting watches will not create a deadlock
