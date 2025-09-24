@@ -1157,40 +1157,59 @@ func TestIterateHierachyV2(t *testing.T) {
 	})
 }
 
+func testClusterParent() *corev1.Namespace {
+	return &corev1.Namespace{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Namespace",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "test-cluster-parent",
+			UID:             "cluster-parent-123",
+			ResourceVersion: "123",
+		},
+	}
+}
+
+func testNamespacedChild() *corev1.Pod {
+	return &corev1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Pod",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "namespaced-child",
+			Namespace:       "test-namespace",
+			UID:             "namespaced-child-456",
+			ResourceVersion: "123",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "v1",
+				Kind:       "Namespace",
+				Name:       "test-cluster-parent",
+			}},
+		},
+	}
+}
+
+func testClusterChild() *unstructured.Unstructured {
+	return strToUnstructured(`
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cluster-child
+  uid: cluster-child-789
+  resourceVersion: "123"
+  ownerReferences:
+  - apiVersion: v1
+    kind: Namespace
+    name: test-cluster-parent
+    uid: cluster-parent-123`)
+}
+
 func TestIterateHierarchyV2_ClusterScopedParents(t *testing.T) {
-	clusterParent := &unstructured.Unstructured{}
-	clusterParent.SetAPIVersion("v1")
-	clusterParent.SetKind("ConfigMap")
-	clusterParent.SetName("cluster-parent")
-	clusterParent.SetUID("parent-123")
-
-	namespacedChild := &unstructured.Unstructured{}
-	namespacedChild.SetAPIVersion("v1")
-	namespacedChild.SetKind("Pod")
-	namespacedChild.SetName("namespaced-child")
-	namespacedChild.SetNamespace("test-namespace")
-	namespacedChild.SetUID("child-456")
-	namespacedChild.SetOwnerReferences([]metav1.OwnerReference{{
-		APIVersion: "v1",
-		Kind:       "ConfigMap",
-		Name:       "cluster-parent",
-	}})
-
-	clusterChild := &unstructured.Unstructured{}
-	clusterChild.SetAPIVersion("rbac.authorization.k8s.io/v1")
-	clusterChild.SetKind("ClusterRole")
-	clusterChild.SetName("cluster-child")
-	clusterChild.SetUID("child-789")
-	clusterChild.SetOwnerReferences([]metav1.OwnerReference{{
-		APIVersion: "v1",
-		Kind:       "ConfigMap",
-		Name:       "cluster-parent",
-		UID:        "parent-123",
-	}})
-
-	cluster := newCluster(t, clusterParent, namespacedChild, clusterChild).WithAPIResources([]kube.APIResourceInfo{{
-		GroupKind:            schema.GroupKind{Group: "", Kind: "ConfigMap"},
-		GroupVersionResource: schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"},
+	cluster := newCluster(t, testClusterParent(), testNamespacedChild(), testClusterChild()).WithAPIResources([]kube.APIResourceInfo{{
+		GroupKind:            schema.GroupKind{Group: "", Kind: "Namespace"},
+		GroupVersionResource: schema.GroupVersionResource{Group: "", Version: "v1", Resource: "namespaces"},
 		Meta:                 metav1.APIResource{Namespaced: false},
 	}, {
 		GroupKind:            schema.GroupKind{Group: "rbac.authorization.k8s.io", Kind: "ClusterRole"},
@@ -1202,7 +1221,7 @@ func TestIterateHierarchyV2_ClusterScopedParents(t *testing.T) {
 
 	keys := []kube.ResourceKey{}
 	cluster.IterateHierarchyV2(
-		[]kube.ResourceKey{kube.GetResourceKey(clusterParent)},
+		[]kube.ResourceKey{kube.GetResourceKey(mustToUnstructured(testClusterParent()))},
 		func(resource *Resource, _ map[kube.ResourceKey]*Resource) bool {
 			keys = append(keys, resource.ResourceKey())
 			return true
@@ -1210,36 +1229,18 @@ func TestIterateHierarchyV2_ClusterScopedParents(t *testing.T) {
 	)
 
 	assert.ElementsMatch(t, []kube.ResourceKey{
-		kube.GetResourceKey(clusterParent),
-		kube.GetResourceKey(namespacedChild),
-		kube.GetResourceKey(clusterChild),
+		kube.GetResourceKey(mustToUnstructured(testClusterParent())),
+		kube.GetResourceKey(mustToUnstructured(testNamespacedChild())),
+		kube.GetResourceKey(mustToUnstructured(testClusterChild())),
 	}, keys)
 }
 
 func TestIterateHierarchyV2_DisabledClusterScopedParents(t *testing.T) {
 	t.Setenv("GITOPS_ENGINE_DISABLE_CLUSTER_SCOPED_PARENT_REFS", "1")
 
-	clusterParent := &unstructured.Unstructured{}
-	clusterParent.SetAPIVersion("v1")
-	clusterParent.SetKind("ConfigMap")
-	clusterParent.SetName("cluster-parent")
-	clusterParent.SetUID("parent-123")
-
-	namespacedChild := &unstructured.Unstructured{}
-	namespacedChild.SetAPIVersion("v1")
-	namespacedChild.SetKind("Pod")
-	namespacedChild.SetName("namespaced-child")
-	namespacedChild.SetNamespace("test-namespace")
-	namespacedChild.SetUID("child-456")
-	namespacedChild.SetOwnerReferences([]metav1.OwnerReference{{
-		APIVersion: "v1",
-		Kind:       "ConfigMap",
-		Name:       "cluster-parent",
-	}})
-
-	cluster := newCluster(t, clusterParent, namespacedChild).WithAPIResources([]kube.APIResourceInfo{{
-		GroupKind:            schema.GroupKind{Group: "", Kind: "ConfigMap"},
-		GroupVersionResource: schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"},
+	cluster := newCluster(t, testClusterParent(), testNamespacedChild()).WithAPIResources([]kube.APIResourceInfo{{
+		GroupKind:            schema.GroupKind{Group: "", Kind: "Namespace"},
+		GroupVersionResource: schema.GroupVersionResource{Group: "", Version: "v1", Resource: "namespaces"},
 		Meta:                 metav1.APIResource{Namespaced: false},
 	}})
 	err := cluster.EnsureSynced()
@@ -1247,7 +1248,7 @@ func TestIterateHierarchyV2_DisabledClusterScopedParents(t *testing.T) {
 
 	keys := []kube.ResourceKey{}
 	cluster.IterateHierarchyV2(
-		[]kube.ResourceKey{kube.GetResourceKey(clusterParent)},
+		[]kube.ResourceKey{kube.GetResourceKey(mustToUnstructured(testClusterParent()))},
 		func(resource *Resource, _ map[kube.ResourceKey]*Resource) bool {
 			keys = append(keys, resource.ResourceKey())
 			return true
@@ -1255,7 +1256,7 @@ func TestIterateHierarchyV2_DisabledClusterScopedParents(t *testing.T) {
 	)
 
 	// When disabled, should only visit the parent
-	assert.Equal(t, []kube.ResourceKey{kube.GetResourceKey(clusterParent)}, keys)
+	assert.Equal(t, []kube.ResourceKey{kube.GetResourceKey(mustToUnstructured(testClusterParent()))}, keys)
 }
 
 // Test_watchEvents_Deadlock validates that starting watches will not create a deadlock
