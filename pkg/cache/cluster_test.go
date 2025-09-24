@@ -19,6 +19,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -1191,19 +1192,24 @@ func testNamespacedChild() *corev1.Pod {
 	}
 }
 
-func testClusterChild() *unstructured.Unstructured {
-	return strToUnstructured(`
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: cluster-child
-  uid: cluster-child-789
-  resourceVersion: "123"
-  ownerReferences:
-  - apiVersion: v1
-    kind: Namespace
-    name: test-cluster-parent
-    uid: cluster-parent-123`)
+func testClusterChild() *rbacv1.ClusterRole {
+	return &rbacv1.ClusterRole{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "rbac.authorization.k8s.io/v1",
+			Kind:       "ClusterRole",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "cluster-child",
+			UID:             "cluster-child-789",
+			ResourceVersion: "123",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "v1",
+				Kind:       "Namespace",
+				Name:       "test-cluster-parent",
+				UID:        "cluster-parent-123",
+			}},
+		},
+	}
 }
 
 func TestIterateHierarchyV2_ClusterScopedParents(t *testing.T) {
